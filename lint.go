@@ -41,12 +41,16 @@ func DefaultLintConfig() LintConfig {
 
 // CollectLintIssues evaluates all HTML lint rules and returns human-readable issues.
 func (p *Page) CollectLintIssues(cfg LintConfig) []string {
+	return collectLintIssues(p.Doc, p.Body, cfg)
+}
+
+func collectLintIssues(doc *goquery.Document, body string, cfg LintConfig) []string {
 	var issues []string
 
 	seenIDs := make(map[string]int)
 
 	// 1. Enforce unique, non-empty element IDs.
-	p.Doc.Find("[id]").Each(func(_ int, s *goquery.Selection) {
+	doc.Find("[id]").Each(func(_ int, s *goquery.Selection) {
 		id := strings.TrimSpace(s.AttrOr("id", ""))
 		if id == "" {
 			issues = append(issues, fmt.Sprintf("empty id on <%s>", goquery.NodeName(s)))
@@ -61,8 +65,8 @@ func (p *Page) CollectLintIssues(cfg LintConfig) []string {
 	})
 
 	// 2. Check static #id hx-target attributes against KnownTargets and full-page DOM.
-	isFullPage, firstTag := documentStart(p.Body)
-	p.Doc.Find("[hx-target]").Each(func(_ int, s *goquery.Selection) {
+	isFullPage, firstTag := documentStart(body)
+	doc.Find("[hx-target]").Each(func(_ int, s *goquery.Selection) {
 		target := strings.TrimSpace(s.AttrOr("hx-target", ""))
 		if !strings.HasPrefix(target, "#") || strings.ContainsAny(target, " >+~.[]:,") {
 			return
@@ -87,7 +91,7 @@ func (p *Page) CollectLintIssues(cfg LintConfig) []string {
 		}
 	}
 
-	p.Doc.Find("[hx-swap-oob]").Each(func(_ int, s *goquery.Selection) {
+	doc.Find("[hx-swap-oob]").Each(func(_ int, s *goquery.Selection) {
 		oob := strings.TrimSpace(s.AttrOr("hx-swap-oob", ""))
 		targetID := strings.TrimSpace(s.AttrOr("id", ""))
 
@@ -107,7 +111,7 @@ func (p *Page) CollectLintIssues(cfg LintConfig) []string {
 		}
 	})
 
-	p.Doc.Find("tr[hx-swap-oob], td[hx-swap-oob], th[hx-swap-oob], tbody[hx-swap-oob]").Each(func(_ int, s *goquery.Selection) {
+	doc.Find("tr[hx-swap-oob], td[hx-swap-oob], th[hx-swap-oob], tbody[hx-swap-oob]").Each(func(_ int, s *goquery.Selection) {
 		if s.Closest("table").Length() == 0 {
 			issues = append(issues, fmt.Sprintf("<%s id=%q> uses hx-swap-oob without an enclosing <table> wrapper",
 				goquery.NodeName(s), s.AttrOr("id", "(no id)")))
@@ -116,14 +120,14 @@ func (p *Page) CollectLintIssues(cfg LintConfig) []string {
 
 	// 4. Require explicit type="button" on <button hx-*> inside <form>.
 	const htmxFormButtons = "form button[hx-get], form button[hx-post], form button[hx-put], form button[hx-patch], form button[hx-delete]"
-	p.Doc.Find(htmxFormButtons).Each(func(_ int, s *goquery.Selection) {
+	doc.Find(htmxFormButtons).Each(func(_ int, s *goquery.Selection) {
 		if strings.ToLower(strings.TrimSpace(s.AttrOr("type", ""))) != "button" {
 			issues = append(issues, fmt.Sprintf("<button id=%q> inside <form> uses hx-* without type=\"button\"", s.AttrOr("id", "(no id)")))
 		}
 	})
 
 	// 5. Enforce project CSS / inline-style rules.
-	p.Doc.Find("[style]").Each(func(_ int, s *goquery.Selection) {
+	doc.Find("[style]").Each(func(_ int, s *goquery.Selection) {
 		raw := strings.TrimSpace(s.AttrOr("style", ""))
 		if raw == "" {
 			return
@@ -153,7 +157,7 @@ func (p *Page) CollectLintIssues(cfg LintConfig) []string {
 
 	// 6. Enforce scoped triggers unless explicitly allowlisted by element ID.
 	if cfg.StrictScopedTriggers {
-		p.Doc.Find("[hx-trigger], [data-hx-trigger]").Each(func(_ int, s *goquery.Selection) {
+		doc.Find("[hx-trigger], [data-hx-trigger]").Each(func(_ int, s *goquery.Selection) {
 			raw := strings.TrimSpace(s.AttrOr("hx-trigger", s.AttrOr("data-hx-trigger", "")))
 
 			id := strings.TrimSpace(s.AttrOr("id", ""))

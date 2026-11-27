@@ -12,5 +12,11 @@ cfg := uitest.DefaultLintConfig()
 uitest.NewHarness(t, handler).GetPage("/").AssertStatus(http.StatusOK).Lint(cfg)
 ```
 
+For a source scan outside a test, call
+`uitest.ScanSourceRules(rootDir, uitest.DefaultLintConfig())`. It returns
+findings with a file path, line, column, and message. A scan failure returns an
+error. Use `ReportSourceRules` to print findings from a Go test and optionally
+treat them as errors.
+
 When developing alongside Chopstick, check out both repositories under the
 same parent directory so Chopstick can resolve `../htmx-linter`.

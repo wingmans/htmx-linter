@@ -5,7 +5,6 @@ import (
 	"go/ast"
 	goparser "go/parser"
 	"io/fs"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -13,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PuerkitoBio/goquery"
 	templparser "github.com/a-h/templ/parser/v2"
 	"github.com/a-h/templ/parser/v2/visitor"
 )
@@ -21,6 +21,15 @@ var (
 	cssCommentRe  = regexp.MustCompile(`(?s)/\*.*?\*/`)
 	cssFixedDimRe = regexp.MustCompile(`(?i)[{;]\s*((?:min-|max-)?(?:width|height)\s*:\s*[+-]?(?:\d+\.?\d*|\.\d+)px\b)`)
 )
+
+// SourceDiagnostic describes a lint finding with an absolute file path and
+// one-based coordinates. HTML findings currently use line 1, column 1.
+type SourceDiagnostic struct {
+	Path    string
+	Line    int
+	Column  int
+	Message string
+}
 
 // AssertSourceRules checks authored templates, static HTML, and stylesheets under rootDir.
 func AssertSourceRules(t *testing.T, rootDir string, cfg LintConfig) {
@@ -33,28 +42,47 @@ func AssertSourceRules(t *testing.T, rootDir string, cfg LintConfig) {
 func ReportSourceRules(t *testing.T, rootDir string, cfg LintConfig, warningsAsErrors bool) {
 	t.Helper()
 
+	findings, err := ScanSourceRules(rootDir, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(findings) == 0 {
+		return
+	}
+
 	level := "warning"
 	if warningsAsErrors {
 		level = "error"
 	}
 
+	// Emit diagnostics without a testing.T prefix so editors can link each line.
+	var output strings.Builder
+	output.WriteString("UI source violations:\n")
+	for _, finding := range findings {
+		fmt.Fprintf(&output, "%s:%d:%d: %s: %s\n", finding.Path, finding.Line, finding.Column, level, finding.Message)
+	}
+	fmt.Fprint(os.Stderr, output.String())
+
+	if warningsAsErrors {
+		t.FailNow()
+	}
+}
+
+// ScanSourceRules checks .templ, .css, and .html files under rootDir.
+// It returns diagnostics on a successful scan and an error if scanning fails.
+func ScanSourceRules(rootDir string, cfg LintConfig) ([]SourceDiagnostic, error) {
 	absoluteRoot, err := filepath.Abs(rootDir)
 	if err != nil {
-		t.Fatalf("failed resolving %q: %v", rootDir, err)
+		return nil, fmt.Errorf("failed resolving %q: %w", rootDir, err)
 	}
 
 	root, err := os.OpenRoot(absoluteRoot)
 	if err != nil {
-		t.Fatalf("failed opening %q: %v", rootDir, err)
+		return nil, fmt.Errorf("failed opening %q: %w", rootDir, err)
 	}
 
-	defer func() {
-		if err := root.Close(); err != nil {
-			t.Errorf("failed closing %q: %v", rootDir, err)
-		}
-	}()
-
-	var findings []string
+	var findings []SourceDiagnostic
 
 	err = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -79,47 +107,51 @@ func ReportSourceRules(t *testing.T, rootDir string, cfg LintConfig, warningsAsE
 
 		switch ext {
 		case ".templ":
-			issues, err := templateSourceIssues(sourcePath, string(data), cfg, level)
+			issues, err := templateSourceIssues(sourcePath, string(data), cfg)
 			if err != nil {
 				return err
 			}
 
 			findings = append(findings, issues...)
 		case ".css":
-			findings = append(findings, stylesheetIssues(sourcePath, string(data), level)...)
+			findings = append(findings, stylesheetIssues(sourcePath, string(data))...)
 		case ".html":
-			page := ParsePage(t, http.StatusOK, nil, string(data))
-			for _, issue := range page.CollectLintIssues(cfg) {
-				findings = append(findings, fmt.Sprintf("%s:1:1: %s: %s", sourcePath, level, issue))
+			body := string(data)
+			doc, err := goquery.NewDocumentFromReader(strings.NewReader(body))
+			if err != nil {
+				return fmt.Errorf("parse HTML %s: %w", sourcePath, err)
+			}
+			for _, issue := range collectLintIssues(doc, body, cfg) {
+				findings = append(findings, SourceDiagnostic{Path: sourcePath, Line: 1, Column: 1, Message: issue})
 			}
 		}
 
 		return nil
 	})
+	closeErr := root.Close()
 	if err != nil {
-		t.Fatalf("failed walking %q: %v", rootDir, err)
+		return nil, fmt.Errorf("failed walking %q: %w", rootDir, err)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("failed closing %q: %w", rootDir, closeErr)
 	}
 
-	if len(findings) > 0 {
-		// Emit diagnostics without a testing.T prefix so editors can link each line.
-		fmt.Fprintf(os.Stderr, "UI source violations:\n%s\n", strings.Join(findings, "\n"))
-	}
-
-	if warningsAsErrors && len(findings) > 0 {
-		t.FailNow()
-	}
+	return findings, nil
 }
 
-func templateSourceIssues(path, source string, cfg LintConfig, level string) ([]string, error) {
+func templateSourceIssues(path, source string, cfg LintConfig) ([]SourceDiagnostic, error) {
 	templateFile, err := templparser.ParseString(source)
 	if err != nil {
 		return nil, fmt.Errorf("parse template %s: %w", path, err)
 	}
 
 	var (
-		findings  []string
+		findings  []SourceDiagnostic
 		elementID string
 	)
+	addFinding := func(pos templparser.Position, message string) {
+		findings = append(findings, SourceDiagnostic{Path: path, Line: int(pos.Line) + 1, Column: int(pos.Col) + 1, Message: message})
+	}
 
 	v := visitor.New()
 	visitElement := v.Element
@@ -144,12 +176,11 @@ func templateSourceIssues(path, source string, cfg LintConfig, level string) ([]
 		switch strings.ToLower(attr.Key.String()) {
 		case "style":
 			if !usesCSSVariables(attr.Value) {
-				findings = append(findings, fmt.Sprintf("%s:%d:%d: %s: inline style %q (prefer a CSS class or custom property)",
-					path, pos.Line+1, pos.Col+1, level, attr.Value))
+				addFinding(pos, fmt.Sprintf("inline style %q (prefer a CSS class or custom property)", attr.Value))
 			}
 		case "hx-trigger", "data-hx-trigger":
 			if cfg.StrictScopedTriggers && (elementID == "" || !cfg.AllowedTriggerIDs[elementID]) && usesExternalTrigger(attr.Value) {
-				findings = append(findings, fmt.Sprintf("%s:%d:%d: %s: cross-control/global trigger %q", path, pos.Line+1, pos.Col+1, level, attr.Value))
+				addFinding(pos, fmt.Sprintf("cross-control/global trigger %q", attr.Value))
 			}
 		}
 
@@ -158,8 +189,7 @@ func templateSourceIssues(path, source string, cfg LintConfig, level string) ([]
 	v.ExpressionAttribute = func(attr *templparser.ExpressionAttribute) error {
 		if strings.EqualFold(attr.Key.String(), "style") && !usesCSSVariables(styleExpressionFormat(attr.Expression.Value)) {
 			pos := attr.Expression.Range.From
-			findings = append(findings, fmt.Sprintf("%s:%d:%d: %s: inline style expression %q must set or use CSS custom properties",
-				path, pos.Line+1, pos.Col+1, level, attr.Expression.Value))
+			addFinding(pos, fmt.Sprintf("inline style expression %q must set or use CSS custom properties", attr.Expression.Value))
 		}
 
 		return nil
@@ -212,7 +242,7 @@ func styleExpressionFormat(source string) string {
 	return ""
 }
 
-func stylesheetIssues(path, source, level string) []string {
+func stylesheetIssues(path, source string) []SourceDiagnostic {
 	// Mask comments while keeping offsets and line numbers intact.
 	css := cssCommentRe.ReplaceAllStringFunc(source, func(comment string) string {
 		masked := []byte(comment)
@@ -226,14 +256,18 @@ func stylesheetIssues(path, source, level string) []string {
 	})
 
 	matches := cssFixedDimRe.FindAllStringSubmatchIndex(css, -1)
-	findings := make([]string, 0, len(matches))
+	findings := make([]SourceDiagnostic, 0, len(matches))
 
 	for _, match := range matches {
 		start := match[2]
 		line := strings.Count(css[:start], "\n") + 1
 		column := start - strings.LastIndexByte(css[:start], '\n')
-		findings = append(findings, fmt.Sprintf("%s:%d:%d: %s: hardcoded pixel dimension %q (prefer var(--...), rem, or %%)",
-			path, line, column, level, css[start:match[3]]))
+		findings = append(findings, SourceDiagnostic{
+			Path:    path,
+			Line:    line,
+			Column:  column,
+			Message: fmt.Sprintf("hardcoded pixel dimension %q (prefer var(--...), rem, or %%)", css[start:match[3]]),
+		})
 	}
 
 	return findings
